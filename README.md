@@ -13,10 +13,10 @@ Two sample dylibs are provided—a trivial arithmetic export and a more feature-
 
 ## Layout
 
-- `manual_mapper.cpp/.hpp` – Manual Mach-O loader core.
-- `manual_runner.cpp` – Command-line harness that maps one or more dylibs, executes their exports, and prints the process’ dyld image table before/after to prove the manual load is invisible to dyld.
-- `manual_dylib.cpp` – Minimal example dylib.
-- `complex_manual_dylib.cpp` / `complex_manual_api.hpp` – Larger dylib with global state, chained fixups, and math-library imports.
+- `src/manual_mapper.cpp` / `src/includes/manual_mapper.hpp` – Manual Mach-O loader core.
+- `src/manual_runner.cpp` – Command-line harness that maps one or more dylibs, executes their exports, and prints the process’ dyld image table before/after to prove the manual load is invisible to dyld.
+- `src/manual_dylib.cpp` – Minimal example dylib.
+- `src/complex_manual_dylib.cpp` / `src/includes/complex_manual_api.hpp` – Larger dylib with global state, chained fixups, and math-library imports.
 - `scripts/build.sh` – Helper to build all artifacts into `./binaries`.
 - `binaries/` – Output directory for the compiled dylibs and runner (created on demand).
 

@@ -62,6 +62,26 @@ bool dyldContainsImage(const std::vector<std::string> &images, const std::string
     return false;
 }
 
+std::string executableDirectory() {
+    uint32_t size = PATH_MAX;
+    std::vector<char> buffer(size);
+    if (_NSGetExecutablePath(buffer.data(), &size) == -1) {
+        buffer.resize(size);
+        if (_NSGetExecutablePath(buffer.data(), &size) != 0) {
+            return ".";
+        }
+    }
+
+    char resolved[PATH_MAX];
+    const char *path = realpath(buffer.data(), resolved);
+    std::string fullPath = path ? std::string(path) : std::string(buffer.data());
+    const std::size_t pos = fullPath.find_last_of('/');
+    if (pos == std::string::npos) {
+        return ".";
+    }
+    return fullPath.substr(0, pos);
+}
+
 bool isHttpUrl(const std::string &path) {
     constexpr std::string_view prefix = "http://";
     return path.size() >= prefix.size() &&
@@ -265,8 +285,9 @@ int main(int argc, char *argv[]) {
             targets.emplace_back(argv[i]);
         }
     } else {
-        targets.emplace_back("./libmanual.dylib");
-        targets.emplace_back("./libcomplex_manual.dylib");
+        const std::string baseDir = executableDirectory();
+        targets.emplace_back(baseDir + "/libmanual.dylib");
+        targets.emplace_back(baseDir + "/libcomplex_manual.dylib");
         targets.emplace_back("http://localhost:3000/libmanual.dylib");
     }
 
