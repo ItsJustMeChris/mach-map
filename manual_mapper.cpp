@@ -26,6 +26,11 @@ struct SegmentRuntime {
     uint8_t *mapped = nullptr;
 };
 
+struct ExportNode {
+    uint32_t offset = 0;
+    std::string prefix;
+};
+
 std::vector<uint8_t> readFile(const std::string &path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) {
@@ -584,6 +589,127 @@ void applyChainedFixups(std::vector<SegmentRuntime> &segments, const uint8_t *fi
     }
 }
 
+void parseExportsTrie(const uint8_t *fileData, size_t fileSize,
+                      const linkedit_data_command *exportsTrie,
+                      uint64_t baseVmaddr, ptrdiff_t slide,
+                      std::unordered_map<std::string, void *> &symbols) {
+    if (!exportsTrie || exportsTrie->datasize == 0) {
+        return;
+    }
+
+    const uint64_t dataEnd = static_cast<uint64_t>(exportsTrie->dataoff) +
+                             static_cast<uint64_t>(exportsTrie->datasize);
+    if (dataEnd > fileSize) {
+        throw std::runtime_error("Exports trie exceeds file bounds");
+    }
+
+    const uint8_t *trie = fileData + exportsTrie->dataoff;
+    const size_t trieSize = exportsTrie->datasize;
+
+    std::vector<ExportNode> stack;
+    stack.push_back({0, ""});
+
+    while (!stack.empty()) {
+        ExportNode node = stack.back();
+        stack.pop_back();
+
+        if (node.offset >= trieSize) {
+            throw std::runtime_error("Exports trie node offset out of range");
+        }
+
+        const uint8_t *cursor = trie + node.offset;
+        const uint8_t *end = trie + trieSize;
+
+        uint64_t terminalSize = readULEB128(cursor, end);
+        const uint8_t *terminalStart = cursor;
+        if (terminalSize > static_cast<uint64_t>(end - terminalStart)) {
+            throw std::runtime_error("Exports trie terminal size exceeds buffer");
+        }
+
+        if (terminalSize != 0) {
+            const uint8_t *terminalCursor = terminalStart;
+            const uint8_t *terminalEnd = terminalStart + terminalSize;
+
+            uint64_t flags = readULEB128(terminalCursor, terminalEnd);
+
+            const uint64_t kind = flags & EXPORT_SYMBOL_FLAGS_KIND_MASK;
+            const bool reexport = (flags & EXPORT_SYMBOL_FLAGS_REEXPORT) != 0;
+            const bool stubAndResolver =
+                (flags & EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER) != 0;
+
+            if (!reexport) {
+                uint64_t symbolAddress = 0;
+
+                if (stubAndResolver) {
+                    uint64_t stubOffset = readULEB128(terminalCursor, terminalEnd);
+                    uint64_t resolverOffset = readULEB128(terminalCursor, terminalEnd);
+                    (void)resolverOffset;
+                    symbolAddress = baseVmaddr + stubOffset + static_cast<uint64_t>(slide);
+                } else if (kind == EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE) {
+                    symbolAddress = readULEB128(terminalCursor, terminalEnd);
+                } else {
+                    uint64_t offset = readULEB128(terminalCursor, terminalEnd);
+                    symbolAddress = baseVmaddr + offset + static_cast<uint64_t>(slide);
+                }
+
+                if (kind == EXPORT_SYMBOL_FLAGS_KIND_THREAD_LOCAL) {
+                    // treat as data pointer; TLS handling out of scope
+                }
+
+                std::string fullName = node.prefix;
+                if (!fullName.empty()) {
+                    symbols.emplace(fullName, reinterpret_cast<void *>(symbolAddress));
+                    if (fullName.size() > 1 && fullName.front() == '_') {
+                        symbols.emplace(fullName.substr(1),
+                                        reinterpret_cast<void *>(symbolAddress));
+                    }
+                }
+            } else {
+                (void)readULEB128(terminalCursor, terminalEnd); // ordinal
+                if (terminalCursor < terminalEnd) {
+                    while (terminalCursor < terminalEnd && *terminalCursor != '\0') {
+                        ++terminalCursor;
+                    }
+                    if (terminalCursor < terminalEnd) {
+                        ++terminalCursor;
+                    }
+                }
+            }
+        }
+
+        cursor = terminalStart + terminalSize;
+        if (cursor >= end) {
+            continue;
+        }
+
+        const uint8_t childCount = *cursor++;
+        for (uint8_t i = 0; i < childCount; ++i) {
+            if (cursor >= end) {
+                throw std::runtime_error("Exports trie child exceeds buffer");
+            }
+
+            std::string edgeName;
+            while (cursor < end && *cursor != '\0') {
+                edgeName.push_back(static_cast<char>(*cursor++));
+            }
+            if (cursor >= end) {
+                throw std::runtime_error("Exports trie malformed child name");
+            }
+            ++cursor; // skip null terminator
+
+            uint64_t childOffset = readULEB128(cursor, end);
+            if (childOffset > UINT32_MAX) {
+                throw std::runtime_error("Exports trie child offset too large");
+            }
+
+            ExportNode childNode;
+            childNode.offset = static_cast<uint32_t>(childOffset);
+            childNode.prefix = node.prefix + edgeName;
+            stack.push_back(std::move(childNode));
+        }
+    }
+}
+
 int vmProtToMmapProt(vm_prot_t prot) {
     int result = 0;
     if (prot & VM_PROT_READ) {
@@ -623,6 +749,7 @@ LoadedImage loadThinMachO(const uint8_t *data, size_t size, const LoaderOptions 
     const symtab_command *symtab = nullptr;
     const dyld_info_command *dyldInfo = nullptr;
     const linkedit_data_command *chainedFixups = nullptr;
+    const linkedit_data_command *exportsTrie = nullptr;
 
     for (uint32_t i = 0; i < header->ncmds; ++i) {
         if (cursor + sizeof(load_command) > end) {
@@ -655,6 +782,11 @@ LoadedImage loadThinMachO(const uint8_t *data, size_t size, const LoaderOptions 
                 throw std::runtime_error("LC_DYLD_CHAINED_FIXUPS has unexpected size");
             }
             chainedFixups = reinterpret_cast<const linkedit_data_command *>(cursor);
+        } else if (lc->cmd == LC_DYLD_EXPORTS_TRIE) {
+            if (lc->cmdsize != sizeof(linkedit_data_command)) {
+                throw std::runtime_error("LC_DYLD_EXPORTS_TRIE has unexpected size");
+            }
+            exportsTrie = reinterpret_cast<const linkedit_data_command *>(cursor);
         }
 
         cursor += lc->cmdsize;
@@ -798,6 +930,7 @@ LoadedImage loadThinMachO(const uint8_t *data, size_t size, const LoaderOptions 
     }
 
     std::unordered_map<std::string, void *> symbols;
+    parseExportsTrie(data, size, exportsTrie, minVmaddr, slide, symbols);
     if (symtab) {
         const uint64_t symEnd =
             static_cast<uint64_t>(symtab->symoff) +
