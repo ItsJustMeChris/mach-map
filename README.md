@@ -31,7 +31,7 @@ The script rebuilds all artifacts with `clang++` and drops them into `./binaries
 ## Running
 
 ```bash
-# Exercise both example dylibs (default behaviour)
+# Exercise both local dylibs plus a remote fetch (default behaviour)
 ./binaries/manual_runner
 
 # Or target a specific dylib (or multiple)
@@ -40,6 +40,20 @@ The script rebuilds all artifacts with `clang++` and drops them into `./binaries
 
 - When the simple dylib is loaded, you’ll see the result of `manual_entry(5)` and the exported status string.
 - When the complex dylib is loaded, the runner feeds in sample data, prints the computed statistics, histogram, and percentiles, and shows that the dyld image list remains unchanged (`[dyld] image present: no`).
+
+### Serving and Fetching Over HTTP
+
+You can serve the compiled dylib over HTTP using the bundled Bun script, then have the runner download and map it directly from the network:
+
+```bash
+# Terminal 1 – start the static Bun server (requires Bun v1+)
+bun scripts/server.ts
+
+# Terminal 2 – fetch and map the dylib via HTTP (note: http:// only)
+./binaries/manual_runner http://localhost:3000/libmanual.dylib
+```
+
+The runner performs a minimal HTTP/1.0 GET (no TLS) and feeds the downloaded bytes into `loadMachOImageFromBuffer`, demonstrating remote delivery without involving `dyld`. When invoked with no arguments the runner will also attempt this remote fetch automatically (pointing at `http://localhost:3000/libmanual.dylib`), so keep the Bun server running if you want the default flow to succeed.
 
 ## Custom Symbol Resolution
 

@@ -1,14 +1,21 @@
 #include "complex_manual_api.hpp"
 #include "manual_mapper.hpp"
 
+#include <algorithm>
+#include <arpa/inet.h>
+#include <array>
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
-#include <mach-o/dyld.h>
-#include <string>
-#include <vector>
 #include <limits.h>
+#include <mach-o/dyld.h>
+#include <netdb.h>
+#include <sstream>
+#include <string>
+#include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 namespace {
 
@@ -42,6 +49,10 @@ void reportDyldImages(const std::string &label) {
 }
 
 bool dyldContainsImage(const std::vector<std::string> &images, const std::string &path) {
+    if (path.empty()) {
+        return false;
+    }
+
     const std::string canon = canonicalPath(path);
     for (const auto &img : images) {
         if (img == canon) {
@@ -49,6 +60,121 @@ bool dyldContainsImage(const std::vector<std::string> &images, const std::string
         }
     }
     return false;
+}
+
+bool isHttpUrl(const std::string &path) {
+    constexpr std::string_view prefix = "http://";
+    return path.size() >= prefix.size() &&
+           std::equal(prefix.begin(), prefix.end(), path.begin());
+}
+
+std::vector<uint8_t> downloadHttp(const std::string &url) {
+    constexpr std::string_view prefix = "http://";
+    if (!isHttpUrl(url)) {
+        throw std::runtime_error("Only http:// URLs are supported");
+    }
+
+    const std::size_t hostStart = prefix.size();
+    const std::size_t slashPos = url.find('/', hostStart);
+    std::string hostPort = slashPos == std::string::npos ? url.substr(hostStart)
+                                                         : url.substr(hostStart, slashPos - hostStart);
+    std::string path = slashPos == std::string::npos ? "/" : url.substr(slashPos);
+
+    std::string host;
+    std::string port = "80";
+    const std::size_t colonPos = hostPort.find(':');
+    if (colonPos != std::string::npos) {
+        host = hostPort.substr(0, colonPos);
+        port = hostPort.substr(colonPos + 1);
+    } else {
+        host = hostPort;
+    }
+
+    if (host.empty()) {
+        throw std::runtime_error("Invalid HTTP URL (missing host): " + url);
+    }
+
+    struct addrinfo hints;
+    std::memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *result = nullptr;
+    int gai = getaddrinfo(host.c_str(), port.c_str(), &hints, &result);
+    if (gai != 0) {
+        throw std::runtime_error("getaddrinfo failed: " + std::string(gai_strerror(gai)));
+    }
+
+    int sockfd = -1;
+    for (struct addrinfo *rp = result; rp != nullptr; rp = rp->ai_next) {
+        sockfd = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sockfd == -1) {
+            continue;
+        }
+        if (::connect(sockfd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break;
+        }
+        ::close(sockfd);
+        sockfd = -1;
+    }
+
+    if (sockfd == -1) {
+        freeaddrinfo(result);
+        throw std::runtime_error("Failed to connect to " + host + ":" + port);
+    }
+
+    std::ostringstream request;
+    request << "GET " << path << " HTTP/1.0\r\n"
+            << "Host: " << host << "\r\n"
+            << "Connection: close\r\n"
+            << "\r\n";
+
+    const std::string requestStr = request.str();
+    ssize_t sent = ::send(sockfd, requestStr.data(), requestStr.size(), 0);
+    if (sent < 0 || static_cast<size_t>(sent) != requestStr.size()) {
+        ::close(sockfd);
+        freeaddrinfo(result);
+        throw std::runtime_error("Failed to send HTTP request");
+    }
+
+    std::vector<uint8_t> buffer;
+    std::array<uint8_t, 4096> chunk{};
+    ssize_t received = 0;
+    while ((received = ::recv(sockfd, chunk.data(), chunk.size(), 0)) > 0) {
+        buffer.insert(buffer.end(), chunk.begin(), chunk.begin() + received);
+    }
+    ::close(sockfd);
+    freeaddrinfo(result);
+
+    if (buffer.empty()) {
+        throw std::runtime_error("Empty HTTP response from " + url);
+    }
+
+    const std::string delimiter = "\r\n\r\n";
+    auto headerEnd = std::search(buffer.begin(), buffer.end(), delimiter.begin(), delimiter.end());
+    if (headerEnd == buffer.end()) {
+        throw std::runtime_error("Malformed HTTP response (missing headers)");
+    }
+
+    const size_t headerLen =
+        static_cast<size_t>(std::distance(buffer.begin(), headerEnd)) + delimiter.size();
+    std::string header(buffer.begin(), buffer.begin() + headerLen);
+
+    std::istringstream headerStream(header);
+    std::string statusLine;
+    if (!std::getline(headerStream, statusLine)) {
+        throw std::runtime_error("Malformed HTTP status line");
+    }
+    if (statusLine.find("200") == std::string::npos) {
+        throw std::runtime_error("Unexpected HTTP status: " + statusLine);
+    }
+
+    std::vector<uint8_t> body(buffer.begin() + headerLen, buffer.end());
+    if (body.empty()) {
+        throw std::runtime_error("HTTP response body is empty");
+    }
+
+    return body;
 }
 
 void runSimpleDemo(const LoadedImage &image) {
@@ -141,6 +267,7 @@ int main(int argc, char *argv[]) {
     } else {
         targets.emplace_back("./libmanual.dylib");
         targets.emplace_back("./libcomplex_manual.dylib");
+        targets.emplace_back("http://localhost:3000/libmanual.dylib");
     }
 
     reportDyldImages("dyld images before manual loads");
@@ -149,12 +276,23 @@ int main(int argc, char *argv[]) {
     bool anySuccess = false;
     bool anyFailure = false;
 
-    for (const std::string &dylibPath : targets) {
-        std::cout << "== Loading " << dylibPath << "\n";
+    for (const std::string &inputPath : targets) {
+        const bool remote = isHttpUrl(inputPath);
+        std::cout << "== Loading " << inputPath << "\n";
         try {
-            LoadedImage image = loadMachOImage(dylibPath);
+            LoadedImage image;
+            std::vector<uint8_t> remoteBuffer;
+
+            if (remote) {
+                remoteBuffer = downloadHttp(inputPath);
+                std::cout << "[http] downloaded " << remoteBuffer.size() << " bytes\n";
+                image = loadMachOImageFromBuffer(remoteBuffer.data(), remoteBuffer.size());
+            } else {
+                image = loadMachOImage(inputPath);
+            }
+
             if (!image.valid()) {
-                std::cerr << "Failed to map image: " << dylibPath << "\n";
+                std::cerr << "Failed to map image: " << inputPath << "\n";
                 anyFailure = true;
                 continue;
             }
@@ -165,16 +303,17 @@ int main(int argc, char *argv[]) {
             runComplexDemo(image);
 
             auto afterImages = currentDyldImages();
-            bool registered = dyldContainsImage(afterImages, dylibPath);
-            std::cout << "[dyld] image present: " << (registered ? "yes" : "no") << "\n";
-            reportDyldImages("dyld images after loading " + dylibPath);
+            bool registered = remote ? false : dyldContainsImage(afterImages, inputPath);
+            std::cout << "[dyld] image present: " << (registered ? "yes" : "no")
+                      << (remote ? " (remote load)" : "") << "\n";
+            reportDyldImages("dyld images after loading " + inputPath);
 
             anySuccess = true;
         } catch (const std::exception &ex) {
-            std::cerr << "Error while loading " << dylibPath << ": " << ex.what() << "\n";
+            std::cerr << "Error while loading " << inputPath << ": " << ex.what() << "\n";
             anyFailure = true;
         } catch (...) {
-            std::cerr << "Unknown error occurred while loading " << dylibPath << "\n";
+            std::cerr << "Unknown error occurred while loading " << inputPath << "\n";
             anyFailure = true;
         }
 
